@@ -10710,6 +10710,11 @@ static void mac_fake_menu_bar_click (EventPriority);
 
 static NSString *localizedMenuTitleForEdit, *localizedMenuTitleForHelp, *localizedMenuTitleForWindow;
 
+/* Tag value used to mark NSMenuItems that Emacs adds to the system
+   windows menu, so we can find and remove just those on the next
+   menu rebuild while leaving AppKit-injected items in place.  */
+#define EMACS_WINDOW_MENU_ITEM_TAG ((NSInteger) 0x456D6163)  /* 'Emac' */
+
 /* Maximum interval time in seconds between key down and modifier key
    release events when they are recognized part of a synthetic
    modified key (e.g., three-finger editing gestures in Sidecar)
@@ -11403,20 +11408,65 @@ mac_fill_menubar (widget_value *first_wv, bool deep_p)
 		}
 	    }
 
-	  submenu = [[NSMenu alloc] initWithTitle:title];
-	  [submenu setAutoenablesItems:NO];
-
-	  if (title == localizedMenuTitleForHelp)
-	    helpMenu = submenu;
-	  else if (title == localizedMenuTitleForWindow)
-	    windowMenu = submenu;
+	  /* For the Window menu, reuse the existing [NSApp windowsMenu]
+	     instance rather than creating a fresh NSMenu.  AppKit injects
+	     system-provided items (e.g. macOS 15's "Move & Resize"
+	     submenu and its tiling key equivalents) into whichever NSMenu
+	     is currently the windows menu, the first time it is tracked.
+	     If we replace that instance on every menu rebuild the items
+	     vanish until the user clicks the Window menu again.  We tag
+	     the items we add so we can strip just those on the next
+	     rebuild, leaving AppKit-injected items intact.  */
+	  if (title == localizedMenuTitleForWindow)
+	    {
+	      NSMenu *existing = [NSApp windowsMenu];
+	      if (existing)
+		{
+		  /* NSMenu only allows one supermenu, so detach from
+		     the old main menu before reattaching under newMenu.  */
+		  for (NSMenuItem *parentItem in [mainMenu itemArray])
+		    if (parentItem.submenu == existing)
+		      {
+			[parentItem setSubmenu:nil];
+			break;
+		      }
+		  NSArray *snapshot = [[existing itemArray] copy];
+		  for (NSMenuItem *it in snapshot)
+		    if (it.tag == EMACS_WINDOW_MENU_ITEM_TAG)
+		      [existing removeItem:it];
+		  MRC_RELEASE (snapshot);
+		  submenu = MRC_RETAIN (existing);
+		}
+	      else
+		{
+		  submenu = [[NSMenu alloc] initWithTitle:title];
+		  [submenu setAutoenablesItems:NO];
+		}
+	      windowMenu = submenu;
+	    }
+	  else
+	    {
+	      submenu = [[NSMenu alloc] initWithTitle:title];
+	      [submenu setAutoenablesItems:NO];
+	      if (title == localizedMenuTitleForHelp)
+		helpMenu = submenu;
+	    }
 
 	  [newMenu setSubmenu:submenu
 		      forItem:[newMenu addItemWithTitle:title action:nil
 					  keyEquivalent:@""]];
 
 	  if (wv->contents)
-	    [submenu fillWithWidgetValue:wv->contents];
+	    {
+	      NSInteger preCount = [submenu numberOfItems];
+	      [submenu fillWithWidgetValue:wv->contents];
+	      if (title == localizedMenuTitleForWindow)
+		{
+		  NSInteger postCount = [submenu numberOfItems];
+		  for (NSInteger i = preCount; i < postCount; i++)
+		    [[submenu itemAtIndex:i] setTag:EMACS_WINDOW_MENU_ITEM_TAG];
+		}
+	    }
 
 	  MRC_RELEASE (submenu);
 	}
@@ -11434,7 +11484,12 @@ mac_fill_menubar (widget_value *first_wv, bool deep_p)
 
 	  [NSApp setMainMenu:newMenu];
 
-	  if (windowMenu && [windowMenu numberOfItems])
+	  /* Only call setWindowsMenu: when the instance has actually
+	     changed.  Calling it on the same NSMenu can re-arm AppKit's
+	     system item injection, producing duplicate "Move & Resize"
+	     entries on the next menu tracking.  */
+	  if (windowMenu && [windowMenu numberOfItems]
+	      && windowMenu != [NSApp windowsMenu])
 	    [NSApp setWindowsMenu:windowMenu];
 
 	  if (helpMenu)
